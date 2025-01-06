@@ -1,0 +1,31 @@
+[package]
+name = "hysteria_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# quic
+quinn-proto = "0.11.8"
+quinn = { version = "0.11", default-features = false, features = [
+    "futures-io",
+    "runtime-tokio",
+    "rustls",
+] }
+h3 = "0.0.6"
+h3-quinn = "0.0.7"
+
+thiserror = "1.0"
+anyhow = "1.0"
+rand = "0.8"
+rustls = { version = "*", default-features = false, features = ["ring"] }
+
+tokio = { version = "1", features = ["full"] }
+
+bytes = "1.6"
+
+http = { version = "1.1" }
+rcgen = "*"
+
+directories-next = "2"
+rustls-pemfile = "2"

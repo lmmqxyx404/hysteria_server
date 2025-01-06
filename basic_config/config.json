@@ -1,0 +1,19 @@
+{
+  "inbound": [
+    {
+      "mode": "TCP",
+      "protocol": "TROJAN",
+      "address": "0.0.0.0",
+      "port": 8081,
+      "secret": "asdfgh",
+      "tls": {
+        "cert_path": "E:\\Rust\\Door\\basic_config\\cert.pem",
+        "key_path": "E:\\Rust\\Door\\basic_config\\key.pem"
+      }
+    }
+  ],
+  "outbound": {
+    "mode": "DIRECT",
+    "protocol": "DIRECT"
+  }
+}

@@ -67,7 +67,6 @@ async fn handle_connection(
         let pwd = shared_passwd.clone();
         let auth_flag = is_authenticated.clone();
         tokio::spawn(async move {
-            todo!()
             /* if let Err(e) = handle_request(request, stream, pwd, auth_flag).await {
                 eprintln!("Request error: {:?}", e);
             } */

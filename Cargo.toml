@@ -29,3 +29,19 @@ rcgen = "*"
 
 directories-next = "2"
 rustls-pemfile = "2"
+
+futures = "0.3"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+    "env-filter",
+    "time",
+    "tracing-log",
+] }
+structopt = "0.3"
+rustls-native-certs = "0.7"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"

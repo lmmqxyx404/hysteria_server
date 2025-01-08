@@ -45,3 +45,11 @@ rustls-native-certs = "0.7"
 [[example]]
 name = "client"
 path = "examples/client.rs"
+
+[[example]]
+name = "server"
+path = "examples/server.rs"
+
+[[example]]
+name = "server_chat"
+path = "examples/server_chat.rs"

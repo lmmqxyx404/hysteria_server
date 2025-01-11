@@ -45,7 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // todo
     // opt.uri = "https://lmmqxyx.us.kg:443".to_string();
     // DNS lookup
-
     let uri = opt.uri.parse::<http::Uri>()?;
 
     if uri.scheme() != Some(&http::uri::Scheme::HTTPS) {
@@ -171,25 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!("response: {:?} {}", resp.version(), resp.status());
         info!("headers are : {:#?}", resp.headers());
-
-        // `recv_data()` must be called after `recv_response()` for
-        // receiving potential response body
-        /* loop {
-            match stream.recv_data().await {
-                Ok(mut chunk) => {
-                    let mut out = tokio::io::stdout();
-                    out.write_all_buf(&mut chunk).await?;
-                    out.flush().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        } */
-        /* while let Some(mut chunk) = stream.recv_data().await? {
-            let mut out = tokio::io::stdout();
-            out.write_all_buf(&mut chunk).await?;
-            out.flush().await?;
-        } */
         let (mut tx, mut rx) = conn.clone().open_bi().await?;
+        // let (mut tx, mut rx) = stream.split(); //conn.clone().open_bi().await?;
         // let buf=
         let mut proxy_data = [
             0x48, 0x45, 0x41, 0x44, 0x20, 0x2F, 0x67, 0x65, 0x6E, 0x65, 0x72, 0x61, 0x74, 0x65,
@@ -202,15 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ];
 
         let res = tx.write_all(&proxy_data).await.unwrap();
-        info!("dealed with tx and rx");
-        /* match rx.read_to_end(1000).await {
-            Ok(res) => {
-                info!("{:?}", res);
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        } */
+        
+        info!("send data successfully");
+        // 不断读取
         let mut buf = [0u8; 1024];
         loop {
             match rx.read(&mut buf).await {
@@ -238,6 +214,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // wait for the connection to be closed before exiting
     client_endpoint.wait_idle().await;
-
     Ok(())
 }

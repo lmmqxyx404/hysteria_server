@@ -1,22 +1,17 @@
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use hysteria_server::tls::load_pem;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::PrivateKeyDer;
 use structopt::StructOpt;
-use tokio::{fs::File, io::AsyncReadExt};
-use tracing::{error, info, trace_span};
+use tokio::{fs::File, io::AsyncReadExt, sync::oneshot::Sender};
+use tracing::{error, info};
 
 use h3::{error::ErrorLevel, quic::BidiStream, server::RequestStream};
 use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 
-// ------------------- CLI/配置项 -------------------
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
 struct Opt {
@@ -77,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 解析命令行参数
     let opt = Opt::from_args();
+
+    // 如果有 --dir，则作为静态文件目录；否则为 None
     let root = if let Some(r) = opt.root {
         if !r.is_dir() {
             return Err(format!("{}: is not a readable directory", r.display()).into());
@@ -89,11 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 加载证书和私钥
-    let (certs, key) = load_pem(&opt.certs.cert, &opt.certs.key)?;
+    let (certs, key) =
+        load_pem(&opt.certs.cert, &opt.certs.key).context("failed to load cert or key")?;
 
+    // 构建 TLS 配置
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_single_cert(certs, key)?; // 这里 certs 类型通常是 Vec<rustls::Certificate>
     tls_config.max_early_data_size = u32::MAX;
     tls_config.alpn_protocols = vec![ALPN.into()];
 
@@ -103,71 +102,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
     info!("listening on {}", opt.listen);
 
-    // 存放“当前连接是否已通过 Hysteria 认证”的标记
-    // 在本示例里，每条新建连接都会走一次 new_conn.await -> handle
-    // 因此这个标记应当放到“连接级别”而非“全局”
-    // （但此处为了示例，写在最外层也行，每个连接都拿一个新的Arc<Mutex<bool>>）
+    // 不断接受新的 QUIC 连接
     while let Some(new_conn) = endpoint.accept().await {
-        trace_span!("New connection being attempted");
-
-        let root_dir = root.clone();
-
+        let root_for_conn = root.clone();
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
-                    info!("new connection established");
-                    // 用 h3::server::Connection 来管理 HTTP/3 流
-                    let mut h3_conn =
-                        match h3::server::Connection::new(h3_quinn::Connection::new(conn.clone())).await {
-                            Ok(h3c) => h3c,
-                            Err(e) => {
-                                error!("Error during HTTP/3 handshake: {:?}", e);
-                                return;
-                            }
-                        };
+                    info!("new connection established: {:?}", conn.remote_address());
 
-                    // 每条连接独有的“是否认证通过”标记
-                    let authed_conn = Arc::new(tokio::sync::Mutex::new(false));
-                    let conn = conn.clone();
-                    let pclone=authed_conn.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_conn(conn.clone(), pclone).await {
-                            error!("handling request failed: {}", e);
-                        }
-                    });
-                    // let asd: quinn::Connection = h3_conn.inner.conn.into();
-                    // 不断接受新的 HTTP/3 请求
-                    loop {
-                        match h3_conn.accept().await {
-                            Ok(Some((req, stream))) => {
-                                info!("new request: {:#?} {}", req, req.uri().path());
-
-                                let root_dir = root_dir.clone();
-                                let authed_conn = authed_conn.clone();
-
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        handle_request(req, stream, root_dir, authed_conn).await
-                                    {
-                                        error!("handling request failed: {}", e);
-                                    }
-                                });
-                            }
-
-                            // 没有更多请求了，客户端关闭了流
-                            Ok(None) => {
-                                break;
-                            }
-
-                            // 出现了 HTTP/3 协议错误
-                            Err(err) => {
-                                error!("error on accept: {}", err);
-                                match err.get_error_level() {
-                                    ErrorLevel::ConnectionError => break,
-                                    ErrorLevel::StreamError => continue,
-                                }
-                            }
-                        }
+                    // 对每个连接，都并行处理:
+                    // 1) HTTP/3 请求
+                    // 2) 原生 QUIC bidirectional 流
+                    if let Err(e) = handle_connection(conn, root_for_conn).await {
+                        error!("connection handler error: {}", e);
                     }
                 }
                 Err(err) => {
@@ -177,49 +124,189 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 优雅关闭
     endpoint.wait_idle().await;
     Ok(())
 }
 
-/// 判断是否为 Hysteria 验证请求
-fn is_hysteria_auth_request(req: &Request<()>) -> bool {
-    // 这里简单判断 PATH 是否 "/hysteria-auth"
-    // 你也可以更灵活地看 Host, Method, Headers, etc.
-    let res = req.method() == http::Method::POST && req.uri().path() == "/auth";
-    info!("res is {res}");
-    return true;
+/// 在同一个 quinn::Connection 上，同时处理：
+/// - HTTP/3 协议 (handle_http3)
+/// - 原生 QUIC 双向流 (handle_raw_bi)
+async fn handle_connection(
+    conn: quinn::Connection,
+    root: Arc<Option<PathBuf>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 分别 spawn 两个任务并发跑
+    let conn_for_h3 = conn.clone();
+    let root_for_h3 = root.clone();
+
+    // 每个连接独有的“是否已认证”标记
+    let authed_conn = Arc::new(tokio::sync::Mutex::new(false));
+    let asd = authed_conn.clone();
+    let (tx_authed, rx_authed) = tokio::sync::oneshot::channel::<bool>();
+
+    let h3_handle = tokio::spawn(async move {
+        info!("handled in h3_handle");
+        if let Err(e) = handle_http3(conn_for_h3, root_for_h3, tx_authed).await {
+            error!("HTTP/3 handling error: {}", e);
+        }
+    });
+
+    let conn_for_raw = conn.clone();
+    let qwe = authed_conn.clone();
+    let raw_handle = tokio::spawn(async move {
+        info!("handled in raw_handle");
+        if let Err(e) = handle_raw_bi(conn_for_raw, qwe).await {
+            error!("Raw QUIC handling error: {}", e);
+        }
+    });
+
+    // 等待二者结束（正常情况下 HTTP/3 不会轻易退出，除非连接被关闭）
+    let _ = tokio::join!(h3_handle, raw_handle);
+    Ok(())
 }
 
+/// 处理 HTTP/3 协议：构造 h3::server::Connection，循环 accept() HTTP/3 请求
+async fn handle_http3(
+    conn: quinn::Connection,
+    root_dir: Arc<Option<PathBuf>>,
+    authed_conn: Sender<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化 h3::server::Connection
+    info!("some thing occured");
+    let mut h3_conn = match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
+        Ok(h3c) => h3c,
+        Err(e) => {
+            error!("Error during HTTP/3 handshake: {:?}", e);
+            return Err(e.into());
+        }
+    };
+
+    // 不断接受新的 HTTP/3 请求
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some((req, stream))) => {
+                info!(
+                    "new HTTP/3 request: {} {:?}",
+                    req.uri().path(),
+                    req.method()
+                );
+
+                let root_for_req = root_dir.clone();
+                // let authed_conn_for_req = authed_conn.clone();
+
+                // 每个请求丢进一个任务单独处理
+                tokio::spawn(async move {
+                    if let Err(e) = handle_request(req, stream, root_for_req).await {
+                        error!("handling request failed: {}", e);
+                    }
+                });
+            }
+            Ok(None) => {
+                // 没有更多请求了，对端关闭了 HTTP/3 连接
+                info!("client closed HTTP/3 connection");
+                break;
+            }
+            Err(err) => {
+                error!("error on accept H3: {}", err);
+                match err.get_error_level() {
+                    ErrorLevel::ConnectionError => {
+                        // 连接级别错误 -> 退出循环
+                        break;
+                    }
+                    ErrorLevel::StreamError => {
+                        // 流级别错误 -> 继续接受下一个请求
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// 原生 QUIC 双向流处理：循环 accept_bi()，读取客户端发送的裸数据。
+async fn handle_raw_bi(
+    conn: quinn::Connection,
+    authed_conn: Arc<tokio::sync::Mutex<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let lock = authed_conn.lock().await;
+    if *lock == false {
+        return Ok(());
+    }
+    loop {
+        match conn.accept_bi().await {
+            Ok((mut wstream, mut rstream)) => {
+                info!("(raw QUIC) got a new bidirectional stream");
+                // 对每个新的bi-stream，spawn一个任务
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match rstream.read(&mut buf).await {
+                            Ok(Some(n)) => {
+                                info!(
+                                    "(raw QUIC) Received {} bytes on this stream: {:?}",
+                                    n,
+                                    &buf[..n]
+                                );
+                                // 需要回发的话，可以 wstream.write_all(...)；此处仅演示接收
+                            }
+                            Ok(None) => {
+                                info!("(raw QUIC) peer closed sending half");
+                                break;
+                            }
+                            Err(e) => {
+                                error!("(raw QUIC) read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    // 若需要在此处 wstream.finish() 可以酌情操作
+                });
+            }
+            // 对端把连接关掉
+            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                info!("(raw QUIC) connection closed by peer");
+                return Ok(());
+            }
+            Err(e) => {
+                error!("(raw QUIC) accept_bi failed: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+/// 是否是 Hysteria 认证请求 (示例)
+fn is_hysteria_auth_request(req: &Request<()>) -> bool {
+    // 你自己的判断逻辑，这里简单判断一下
+    req.method() == http::Method::POST && req.uri().path() == "/auth"
+}
+
+/// 伪造一个 do_auth，用于演示
 fn do_auth() -> bool {
     true
 }
 
-/// 处理每个 HTTP/3 请求:
-/// - 如果是 /hysteria-auth, 做认证
-/// - 如果已认证 && path=/tcp, 进行TCP隧道（演示）
-/// - 否则按文件服务器逻辑处理
+/// 处理每个 HTTP/3 请求
 async fn handle_request<T>(
     req: Request<()>,
     mut stream: RequestStream<T, Bytes>,
     serve_root: Arc<Option<PathBuf>>,
-    authed_conn: Arc<tokio::sync::Mutex<bool>>,
+    // authed_conn: Arc<tokio::sync::Mutex<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: BidiStream<Bytes>,
 {
-    info!("started handle request");
-    let mut guard = authed_conn.lock().await;
-    let is_authed = *guard;
+    // let mut guard = authed_conn.lock().await;
+    // let is_authed = *guard;
 
-    // ================ 1. 若是 Hysteria 认证请求 ================
+    // ========== 1. 如果是 Hysteria 认证 ==========
     if is_hysteria_auth_request(&req) {
         if do_auth() {
-            // 认证成功 -> 记录在这个连接的标记上
-            *guard = true;
-            drop(guard); // 解锁
+            // *guard = true;
+            // drop(guard);
 
-            // 返回 233 (HyOK) 状态码 + Hysteria-UDP/Hysteria-CC-RX 等头
             let resp = Response::builder()
                 .status(StatusCode::from_u16(233).unwrap())
                 .header("Hysteria-UDP", "true")
@@ -227,12 +314,10 @@ where
                 .header("Hysteria-Padding", "random-or-whatever")
                 .body(())
                 .unwrap();
-
             stream.send_response(resp).await?;
             info!("Hysteria auth success: responded 233");
             return Ok(stream.finish().await?);
         } else {
-            // 验证失败
             let resp = Response::builder().status(403).body(()).unwrap();
             stream.send_response(resp).await?;
             info!("Hysteria auth fail: responded 403");
@@ -240,83 +325,26 @@ where
         }
     }
 
-    // ================ 2. 如果连接已认证 && path = "/tcp" => 做TCP隧道 ================
-    // 这只是一个演示：客户端可以在已经认证后发送 `POST /tcp` 并带上要连接的目标
-    // （比如 X-Target: example.com:80）来请求代理
-    if is_authed {
-        info!("prepare to deal with accepted data");
-        let (send, mut recv) = stream.split();
-        match recv.recv_data().await {
-            Ok(res) => {
-                let res = res.unwrap();
-                // res.into()
-                // println!("")
-                // let asd = res.into();
-                // info!("res is {:?}", asd);
-                todo!()
-            }
-            Err(e) => return Err(Box::new(e)),
-        }
-        /* let target = match req.headers().get("X-Target") {
-            Some(h) => h.to_str().unwrap_or_default(),
-            None => {
-                // 缺少目标，就返回400
-                let resp = Response::builder().status(400).body(()).unwrap();
-                stream.send_response(resp).await?;
-                return Ok(stream.finish().await?);
-            }
-        };
-
+    // ========== 2. 如果已经认证了 && path=/tcp => 做 TCP 隧道 (示例) ==========
+    // 此处仅演示，留给你自行扩展
+    // if is_authed && req.uri().path() == "/tcp" {
+    if req.uri().path() == "/tcp" {
+        info!("client wants a TCP tunnel (already authed). you'd do logic here...");
+        // 省略：演示如何 echo/或转发
         let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
-        let mut send_stream = stream.send_response(resp).await?; */
-
-        // 准备与目标服务器建立 TCP 连接
-        /* match tokio::net::TcpStream::connect(target).await {
-            Ok(remote_tcp) => {
-                // 分割成读写
-                let (mut remote_r, mut remote_w) = tokio::io::split(remote_tcp);
-
-                // h3::server::RequestStream split:
-                // - req_body (client -> server) =>  stream.body_mut()
-                // - resp_body (server -> client) => send_stream
-                // 但 h3 不像 HTTP/1/2 那样可无限写 response body，需要注意
-                // 这里只是示例，展示思路
-                let (mut req_body, mut resp_body) = stream.split();
-
-                // 并行复制
-                let client_to_tcp = tokio::io::copy(&mut req_body, &mut remote_w);
-                let tcp_to_client = tokio::io::copy(&mut remote_r, &mut send_stream);
-
-                let (res1, res2) = tokio::join!(client_to_tcp, tcp_to_client);
-                if let Err(e) = res1 {
-                    error!("Error copying client->TCP: {:?}", e);
-                }
-                if let Err(e) = res2 {
-                    error!("Error copying TCP->client: {:?}", e);
-                }
-
-                info!("TCP bridging finished for target: {}", target);
-                // 最后 finish
-                send_stream.finish().await?;
-            }
-            Err(e) => {
-                error!("Failed to connect target {}: {:?}", target, e);
-                let resp = Response::builder().status(502).body(()).unwrap();
-                stream.send_response(resp).await?;
-                stream.finish().await?;
-            }
-        }
-        return Ok(()); */
+        let mut send_stream = stream.send_response(resp).await?;
+        // ...
+        // 需要后面自己处理 stream.split() -> body 与 send_stream 互相转发
+        return Ok(());
     }
 
-    drop(guard); // 解锁
+    // drop(guard); // 解锁
 
-    // ================ 3. 否则走原先的“文件服务器/静态资源”逻辑 ================
+    // ========== 3. 否则按“文件服务器/静态资源”逻辑处理 ==========
     let (status, file_to_serve) = match serve_root.as_deref() {
         None => (StatusCode::OK, None),
         Some(root) => {
             if req.uri().path().contains("..") {
-                // 简单防止跨目录
                 (StatusCode::NOT_FOUND, None)
             } else {
                 let path = root.join(req.uri().path().trim_start_matches('/'));
@@ -334,12 +362,20 @@ where
     let resp = Response::builder().status(status).body(())?;
     let mut send_stream = stream.send_response(resp).await?;
 
-    Ok(())
-}
+    /* if let Some(mut f) = file_to_serve {
+        // 把文件内容一口气写给 response body
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send_stream
+                .send_data(Bytes::copy_from_slice(&buf[..n]))
+                .await?;
+        }
+    }
+    send_stream.finish().await?; */
 
-async fn handle_conn(
-    conn: quinn::Connection,
-    state: Arc<tokio::sync::Mutex<bool>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    todo!()
+    Ok(())
 }

@@ -13,6 +13,10 @@ use quinn::{Endpoint, ServerConfig};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
+
+注意双向流的配置
+校验完之后，要在原来的连接基础上，不断的开启双向流
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // CryptoProvider::install_default();

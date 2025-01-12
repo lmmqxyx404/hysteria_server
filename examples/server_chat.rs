@@ -4,9 +4,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use hysteria_server::tls::load_pem;
-use rustls::pki_types::PrivateKeyDer;
+
 use structopt::StructOpt;
-use tokio::{fs::File, io::AsyncReadExt, sync::oneshot::Sender};
+use tokio::fs::File;
 use tracing::{error, info};
 
 use h3::{error::ErrorLevel, quic::BidiStream, server::RequestStream};
@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 不断接受新的 QUIC 连接
     while let Some(new_conn) = endpoint.accept().await {
         let root_for_conn = root.clone();
+
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
@@ -142,7 +143,7 @@ async fn handle_connection(
     // 每个连接独有的“是否已认证”标记
     let authed_conn = Arc::new(tokio::sync::Mutex::new(false));
     let asd = authed_conn.clone();
-    let (tx_authed, rx_authed) = tokio::sync::oneshot::channel::<bool>();
+    let (tx_authed, mut rx_authed) = tokio::sync::mpsc::channel::<bool>(100);
 
     let h3_handle = tokio::spawn(async move {
         info!("handled in h3_handle");
@@ -153,15 +154,36 @@ async fn handle_connection(
 
     let conn_for_raw = conn.clone();
     let qwe = authed_conn.clone();
-    let raw_handle = tokio::spawn(async move {
+
+    match rx_authed.recv().await {
+        Some(true) => {
+            // 客户端已经认证成功了 -> 再启动 handle_raw_bi
+            info!("connection is authed, now handle raw QUIC streams");
+            let authed_for_raw = authed_conn.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_raw_bi(conn, authed_for_raw).await {
+                    error!("Raw QUIC handling error: {}", e);
+                }
+            });
+        }
+        Some(false) => {
+            // 客户端认证失败 或者 handle_http3 里没有发信号就退出
+            info!("no raw QUIC will be handled, because not authed");
+        }
+        None => {
+            info!("can not accept anything");
+        }
+    };
+
+    /* let raw_handle = tokio::spawn(async move {
         info!("handled in raw_handle");
         if let Err(e) = handle_raw_bi(conn_for_raw, qwe).await {
             error!("Raw QUIC handling error: {}", e);
         }
-    });
+    }); */
 
     // 等待二者结束（正常情况下 HTTP/3 不会轻易退出，除非连接被关闭）
-    let _ = tokio::join!(h3_handle, raw_handle);
+    // let _ = tokio::join!(h3_handle, raw_handle);
     Ok(())
 }
 
@@ -169,7 +191,7 @@ async fn handle_connection(
 async fn handle_http3(
     conn: quinn::Connection,
     root_dir: Arc<Option<PathBuf>>,
-    authed_conn: Sender<bool>,
+    tx_authed: tokio::sync::mpsc::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 初始化 h3::server::Connection
     info!("some thing occured");
@@ -180,6 +202,7 @@ async fn handle_http3(
             return Err(e.into());
         }
     };
+    // if let Some(tx) = tx_authed.take() {
 
     // 不断接受新的 HTTP/3 请求
     loop {
@@ -193,13 +216,12 @@ async fn handle_http3(
 
                 let root_for_req = root_dir.clone();
                 // let authed_conn_for_req = authed_conn.clone();
-
                 // 每个请求丢进一个任务单独处理
-                tokio::spawn(async move {
-                    if let Err(e) = handle_request(req, stream, root_for_req).await {
-                        error!("handling request failed: {}", e);
-                    }
-                });
+                // **仅在第一次请求时发送 tx_authed**
+
+                if let Err(e) = handle_request(req, stream, root_for_req, tx_authed.clone()).await {
+                    error!("handling request failed: {}", e);
+                }
             }
             Ok(None) => {
                 // 没有更多请求了，对端关闭了 HTTP/3 连接
@@ -230,10 +252,10 @@ async fn handle_raw_bi(
     conn: quinn::Connection,
     authed_conn: Arc<tokio::sync::Mutex<bool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let lock = authed_conn.lock().await;
+    /* let lock = authed_conn.lock().await;
     if *lock == false {
         return Ok(());
-    }
+    } */
     loop {
         match conn.accept_bi().await {
             Ok((mut wstream, mut rstream)) => {
@@ -294,6 +316,7 @@ async fn handle_request<T>(
     mut stream: RequestStream<T, Bytes>,
     serve_root: Arc<Option<PathBuf>>,
     // authed_conn: Arc<tokio::sync::Mutex<bool>>,
+    tx_authed: tokio::sync::mpsc::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     T: BidiStream<Bytes>,
@@ -316,7 +339,9 @@ where
                 .unwrap();
             stream.send_response(resp).await?;
             info!("Hysteria auth success: responded 233");
-            return Ok(stream.finish().await?);
+            // tx_authed.send(true); // 通知外面
+            stream.finish().await?;
+            return Ok(tx_authed.send(true).await?);
         } else {
             let resp = Response::builder().status(403).body(()).unwrap();
             stream.send_response(resp).await?;

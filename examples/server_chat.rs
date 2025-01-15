@@ -6,7 +6,7 @@ use http::{Request, Response, StatusCode};
 use hysteria_server::tls::load_pem;
 
 use structopt::StructOpt;
-use tokio::fs::File;
+use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::{error, info};
 
 use h3::{error::ErrorLevel, quic::BidiStream, server::RequestStream};
@@ -29,7 +29,9 @@ struct Opt {
     #[structopt(
         short,
         long,
-        default_value = "[::1]:4433",
+        // note: 注意这是一个 IPv6 地址，如果你的系统不支持 IPv6，可以改成 IPv4 地址
+        // default_value = "[::1]:4433",
+        default_value = "127.0.0.1:4433",
         help = "What address:port to listen for new connections"
     )]
     pub listen: SocketAddr,
@@ -247,43 +249,32 @@ async fn handle_http3(
     Ok(())
 }
 
-/// 原生 QUIC 双向流处理：循环 accept_bi()，读取客户端发送的裸数据。
+/// 原生 QUIC 双向流处理：循环 accept_bi()，收到数据后转发给指定 TCP 服务器，再把服务器返回数据转给客户端
 async fn handle_raw_bi(
     conn: quinn::Connection,
-    authed_conn: Arc<tokio::sync::Mutex<bool>>,
+    _authed_conn: Arc<tokio::sync::Mutex<bool>>, // 如果还需要认证，可自行扩展逻辑
 ) -> Result<(), Box<dyn std::error::Error>> {
-    /* let lock = authed_conn.lock().await;
-    if *lock == false {
-        return Ok(());
-    } */
+    // 不断 accept_bi()，处理多条双向流
     loop {
         match conn.accept_bi().await {
-            Ok((mut wstream, mut rstream)) => {
+            Ok((wstream, mut rstream)) => {
                 info!("(raw QUIC) got a new bidirectional stream");
-                // 对每个新的bi-stream，spawn一个任务
+
+                // 为每个 QUIC bidirectional stream 启一个任务去转发
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        match rstream.read(&mut buf).await {
-                            Ok(Some(n)) => {
-                                info!(
-                                    "(raw QUIC) Received {} bytes on this stream: {:?}",
-                                    n,
-                                    &buf[..n]
-                                );
-                                // 需要回发的话，可以 wstream.write_all(...)；此处仅演示接收
-                            }
-                            Ok(None) => {
-                                info!("(raw QUIC) peer closed sending half");
-                                break;
-                            }
-                            Err(e) => {
-                                error!("(raw QUIC) read error: {}", e);
-                                break;
+                    // 1) 连接到远程 TCP 服务器
+                    let remote_addr = "cp.cloudflare.com:80";
+                    match tokio::net::TcpStream::connect(remote_addr).await {
+                        Ok(tcp_stream) => {
+                            if let Err(e) = bridge_quic_to_tcp(rstream, wstream, tcp_stream).await {
+                                error!("bridge error: {}", e);
                             }
                         }
+                        Err(e) => {
+                            error!("connect to {} failed: {}", remote_addr, e);
+                            // 如果需要，可以给客户端发回一个提示或直接关闭。
+                        }
                     }
-                    // 若需要在此处 wstream.finish() 可以酌情操作
                 });
             }
             // 对端把连接关掉
@@ -297,6 +288,44 @@ async fn handle_raw_bi(
             }
         }
     }
+}
+
+/// 桥接函数：把 QUIC 的双向流 (rstream, wstream) 与 TCP 流 (tcp_stream) 互相转发
+async fn bridge_quic_to_tcp(
+    mut rstream: quinn::RecvStream,
+    mut wstream: quinn::SendStream,
+    tcp_stream: tokio::net::TcpStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 拆分 TCP 流为读取端、写入端
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
+
+    // 为了并发转发，可以再拆分成两个方向：
+    // 1) client->server: rstream => tcp_write
+    // 2) server->client: tcp_read => wstream
+
+    // ============== 1) Client -> Server ==============
+    let client_to_server = tokio::spawn(async move {
+        if let Err(e) = tokio::io::copy(&mut rstream, &mut tcp_write).await {
+            error!("copy from QUIC to TCP failed: {}", e);
+        }
+        // client 发送完毕/或者发生错误后，shutdown TCP 的写端
+        let _ = tcp_write.shutdown().await;
+    });
+
+    // ============== 2) Server -> Client ==============
+    let server_to_client = tokio::spawn(async move {
+        if let Err(e) = tokio::io::copy(&mut tcp_read, &mut wstream).await {
+            error!("copy from TCP to QUIC failed: {}", e);
+        }
+        // 服务器发完毕/或者发生错误后，QUIC 端可 finish
+        let _ = wstream.finish();
+    });
+
+    // 同时等待两个方向都结束
+    let _ = tokio::try_join!(client_to_server, server_to_client)?;
+    Ok(())
 }
 
 /// 是否是 Hysteria 认证请求 (示例)

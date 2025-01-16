@@ -42,6 +42,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 structopt = "0.3"
 rustls-native-certs = "0.7"
 
+tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat"] }
+
 [[example]]
 name = "client"
 path = "examples/client.rs"

@@ -1,1 +1,1 @@
-cargo watch -x 'run --example server_chat'
+cargo watch -x 'run --package hysteria_server --bin hysteria_server'

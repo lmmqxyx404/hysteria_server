@@ -2,16 +2,15 @@
 
 use std::{
     env,
-    fs::{self, File},
-    io::BufReader,
-    path::{Path, PathBuf},
+    fs::{self},
+    path::PathBuf,
     sync::Arc,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use quinn::{crypto::rustls::QuicServerConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls_pemfile::pkcs8_private_keys;
+// use rustls_pemfile::pkcs8_private_keys;
 
 /// 简易地生成一个自签证书的 QUIC 服务器配置
 pub fn make_server_config() -> anyhow::Result<ServerConfig> {
@@ -22,18 +21,19 @@ pub fn make_server_config() -> anyhow::Result<ServerConfig> {
     // 示例相对路径
     // let relative_path = Path::new("./basic_config/cert.der");
 
-    let mut cert_path = current_dir.join("./basic_config/cert.pem").canonicalize()?;
-    let mut key_path = current_dir.join("./basic_config/key.pem").canonicalize()?;
-    cert_path = String::from("E://Rust//hysteria_server//basic_config//cert.pem").into();
-    key_path = String::from("E://Rust//hysteria_server//basic_config//key.pem").into();
+    // todo
+    // let mut cert_path = current_dir.join("./basic_config/cert.pem").canonicalize()?;
+    // let mut key_path = current_dir.join("./basic_config/key.pem").canonicalize()?;
+    let cert_path = String::from("E://Rust//hysteria_server//basic_config//cert.pem").into();
+    let key_path = String::from("E://Rust//hysteria_server//basic_config//key.pem").into();
     println!("{:?} {:?}", cert_path, key_path);
 
     let (certs, key) = load_pem(&cert_path, &key_path).unwrap();
 
-    let mut server_crypto = rustls::ServerConfig::builder()
+    let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    let mut server_config =
+    let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
 
     Ok(server_config)

@@ -1,5 +1,5 @@
 use tokio::io::AsyncWriteExt;
-use tracing::{error, info};
+use tracing::error;
 
 /// 桥接函数：把 QUIC 的双向流 (rstream, wstream) 与 TCP 流 (tcp_stream) 互相转发
 pub async fn bridge_quic_to_tcp(
@@ -7,15 +7,12 @@ pub async fn bridge_quic_to_tcp(
     mut wstream: quinn::SendStream,
     tcp_stream: tokio::net::TcpStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // 拆分 TCP 流为读取端、写入端
     let (mut tcp_read, mut tcp_write) = tokio::io::split(tcp_stream);
 
     // 为了并发转发，可以再拆分成两个方向：
     // 1) client->server: rstream => tcp_write
     // 2) server->client: tcp_read => wstream
-
     // ============== 1) Client -> Server ==============
     let client_to_server = tokio::spawn(async move {
         if let Err(e) = tokio::io::copy(&mut rstream, &mut tcp_write).await {

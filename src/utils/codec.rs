@@ -1,12 +1,19 @@
 use std::io;
 
+#[allow(unused)]
 use bytes::{Buf, BufMut, BytesMut};
-use quinn::VarInt;
-use quinn_proto::coding::Codec;
 use tokio_util::codec::{Decoder, Encoder};
+#[allow(unused)]
 use tracing::info;
 
 pub struct Hy2TcpCodec;
+
+#[allow(unused)]
+#[derive(Debug)]
+pub struct Hy2TcpResp {
+    pub status: u8,
+    pub msg: String,
+}
 
 pub trait ServerSide {}
 
@@ -69,6 +76,9 @@ fn hy2_server_resp_parse() {
 
 #[test]
 fn test_varint() {
+    use quinn::VarInt;
+    use quinn_proto::coding::Codec;
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
@@ -83,5 +93,7 @@ fn test_varint() {
     let a = VarInt::decode(&mut buf).unwrap();
     let mut bsd = BytesMut::new();
     VarInt::encode(&a, &mut bsd);
+    // a.encode(&mut bsd);
+
     info!("{:02x?}  {:02x}", a, bsd);
 }
